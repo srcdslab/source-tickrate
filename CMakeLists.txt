@@ -2,8 +2,11 @@
 cmake_minimum_required(VERSION 3.15)
 
 project(tickrate
-    VERSION 1.0.0
+    VERSION 1.4.6
     LANGUAGES CXX C)
+
+# srcdslab fork of angelfor3v3r/source-tickrate, shown by `plugin_print`.
+set(TR_VERSION "${PROJECT_VERSION}-srcdslab")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
@@ -74,8 +77,9 @@ endif ()
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${tickrate_headers} ${tickrate_sources})
 add_library(tickrate SHARED ${tickrate_headers} ${tickrate_sources})
 target_compile_features(tickrate PRIVATE cxx_std_17)
-target_compile_definitions(tickrate PRIVATE NOMINMAX)
-target_link_libraries(tickrate PRIVATE tl::expected scope_guard::scope_guard fmt::fmt safetyhook::safetyhook Zydis)
+target_compile_definitions(tickrate PRIVATE NOMINMAX TR_VERSION="${TR_VERSION}")
+# dlopen/dlinfo/dlsym live in libdl before glibc 2.34 (empty on Windows).
+target_link_libraries(tickrate PRIVATE tl::expected scope_guard::scope_guard fmt::fmt safetyhook::safetyhook Zydis ${CMAKE_DL_LIBS})
 
 if (WIN32)
     if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
