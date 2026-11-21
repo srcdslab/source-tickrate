@@ -468,7 +468,7 @@ public:
 
     cstr GetPluginDescription() noexcept override
     {
-        return "Tickrate (angelfor3v3r)";
+        return "Tickrate " TR_VERSION " (angelfor3v3r)";
     }
 
     void LevelInit(cstr map_name) noexcept override {}

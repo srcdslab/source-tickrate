@@ -1,0 +1,210 @@
+name: CI
+
+# Repo-local workflow: srcdslab/ci-workflows only ships an AMBuild workflow
+# (SourceMod/Metamod extensions), this project is a standalone CMake VSP.
+# Release behaviour follows the other srcdslab repos:
+# - a push to the default branch replaces the "latest" release;
+# - a pushed tag creates a release on that tag.
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "*"
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    # Ubuntu 20.04 ships glibc 2.31 (same as our CS:S server image), so the
+    # .so never needs a newer glibc. The upstream debian:buster image no longer
+    # works: its apt mirrors moved to archive.debian.org.
+    container:
+      image: ubuntu:20.04
+      env:
+        DEBIAN_FRONTEND: noninteractive
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            flags: "-m64"
+            packages: ""
+          - arch: x86
+            flags: "-m32"
+            packages: "g++-multilib"
+    steps:
+      # git must be installed before checkout (real clone) and for CPM.
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git ca-certificates ${{ matrix.packages }}
+
+      - uses: actions/checkout@v7
+
+      - name: Configure
+        run: >
+          cmake -G Ninja -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_FLAGS=${{ matrix.flags }}
+          -DCMAKE_CXX_FLAGS=${{ matrix.flags }}
+          -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/package"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Install
+        run: cmake --install build --config Release
+
+      - name: Check glibc requirement
+        shell: bash
+        run: |
+          set -euo pipefail
+          for so in package/addons/*.so; do
+            max=$(objdump -T "$so" | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -uV | tail -n 1)
+            echo "$so requires glibc $max"
+            if [ "$(printf '%s\n2.31\n' "$max" | sort -V | tail -n 1)" != "2.31" ]; then
+              echo "::error::$so requires glibc $max (> 2.31)"
+              exit 1
+            fi
+          done
+
+      - name: Upload build
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.arch }}
+          path: package
+          if-no-files-found: error
+
+  windows:
+    name: windows-${{ matrix.arch }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            cmake_arch: x64
+          - arch: x86
+            cmake_arch: Win32
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure
+        run: cmake -G "Visual Studio 17 2022" -A ${{ matrix.cmake_arch }} -B build -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/package"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Install
+        run: cmake --install build --config Release
+
+      - name: Upload build
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-${{ matrix.arch }}
+          path: package
+          if-no-files-found: error
+
+  # One archive per OS and architecture, extracting straight into the game
+  # folder (cstrike/, tf/, ...): addons/tickrate_<arch>.{so,dll} + .vdf.
+  # The architectures stay separate: the engine would try to load every .vdf.
+  # Runs on pull requests too, so the packages can be checked before a release.
+  package:
+    name: Package
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: "*-x86*"
+
+      - name: Create archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="latest"
+          if [ "${{ github.ref_type }}" = tag ]; then
+            version="${GITHUB_REF_NAME}"
+          fi
+          mkdir -p dist
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            chmod -R u=rwX,go=rX "$dir"
+            tar -czf "dist/${{ github.event.repository.name }}-${version}-${name}.tar.gz" -C "$dir" addons
+          done
+          for archive in dist/*.tar.gz; do
+            echo "== $archive"
+            tar -tzvf "$archive"
+          done
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-packages
+          path: dist/*
+          if-no-files-found: error
+
+  tag:
+    name: Tag
+    needs: package
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Delete existing "latest" release and tag
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          # The tag may exist without a release, so delete it explicitly
+          git push origin :refs/tags/latest || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: rickstaa/action-create-tag@v1
+        with:
+          tag: latest
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    name: Release
+    needs: [package, tag]
+    if: |
+      always() &&
+      needs.package.result == 'success' &&
+      (needs.tag.result == 'success' || needs.tag.result == 'skipped') &&
+      github.event_name == 'push' &&
+      (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          name: release-packages
+          path: dist
+
+      - name: Release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: "dist/*.tar.gz"
+          tag: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+          file_glob: true
+          overwrite: true
